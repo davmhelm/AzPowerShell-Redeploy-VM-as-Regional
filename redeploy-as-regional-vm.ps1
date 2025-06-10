@@ -1,24 +1,10 @@
-# MIT License
-# 
 # Copyright (c) Microsoft Corporation.
-# 
-# Permission is hereby granted, free of charge, to any person obtaining a copy 
-# of this software and associated documentation files (the "Software"), to deal 
-# in the Software without restriction, including without limitation the rights 
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell 
-# copies of the Software, and to permit persons to whom the Software is 
-# furnished to do so, subject to the following conditions:
-# 
-# The above copyright notice and this permission notice shall be included in all 
-# copies or substantial portions of the Software.
-# 
-# THE SOFTWARE IS PROVIDED *AS IS*, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, 
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE 
-# SOFTWARE.
+# MIT License
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED *AS IS*, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #Requires -Version 7.0
 #Requires -Modules @{ ModuleName="Az.Accounts"; ModuleVersion="4.1.0" }
@@ -34,6 +20,8 @@ Param(
     [string] $DiskNameSuffix = $( Get-Date -Format "yyyyMMddHHmmss" -AsUTC )
 )
 
+$ErrorActionPreference = 'Stop'
+
 # Suppress warnings as of Az.Resources v7.10.0
 Update-AzConfig -DisplayBreakingChangeWarning $false -AppliesTo Az.Resources -Scope Process | Out-Null
 
@@ -41,7 +29,7 @@ try {
     Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Checking zonal deployment"
     if ( $SourceVm.Zones.Count -gt 0 )
     {
-        Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Confirmed resides in logical zone $($SourceVm.Zones)"
+        Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Confirmed resides in logical zone $($SourceVm.Zones), continuing"
 
         # Change DeleteOption on disks and NICs on source VM
         Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Ensuring Disk and NIC delete option is 'Detach'"
@@ -51,62 +39,71 @@ try {
         $SourceVm | Update-AzVM | Out-Null
 
         Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Creating replacement regional VM config"
-        $destVmConfig = New-AzVMConfig -VMName $SourceVm.Name `
+        ( $DestVmConfig = New-AzVMConfig -VMName $SourceVm.Name `
                 -VMSize $SourceVm.HardwareProfile.VmSize `
                 -DiskControllerType $SourceVm.StorageProfile.DiskControllerType `
-                -HibernationEnabled $SourceVm.AdditionalCapabilities.HibernationEnabled
+                -HibernationEnabled $SourceVm.AdditionalCapabilities.HibernationEnabled `
+        ) | Out-Null
 
         # Set properties for destination VM config that are easier to manipulate through direct assignment
         if ( $null -ne $SourceVm.LicenseType ) {
-            $destVmConfig.LicenseType = $SourceVm.LicenseType
+            $DestVmConfig.LicenseType = $SourceVm.LicenseType
         }
         
-        $destVmConfig.AvailabilitySetReference = $null
-        $destVmConfig.DiagnosticsProfile = $SourceVm.DiagnosticsProfile
-        $destVmConfig.AdditionalCapabilities.UltraSSDEnabled = $SourceVm.AdditionalCapabilities.UltraSSDEnabled 
-        $destVmConfig.SecurityProfile = $SourceVm.SecurityProfile
-        $destVmConfig.UserData = $SourceVm.UserData
-        $destVmConfig.Tags = $SourceVm.Tags
-        $destVmConfig.Zones = $null # Recommend explicitly defining this to create a regional VM, as opposed to a zonal VM
+        $DestVmConfig.AvailabilitySetReference = $null
+        $DestVmConfig.DiagnosticsProfile = $SourceVm.DiagnosticsProfile
+        $DestVmConfig.AdditionalCapabilities.UltraSSDEnabled = $SourceVm.AdditionalCapabilities.UltraSSDEnabled 
+        $DestVmConfig.SecurityProfile = $SourceVm.SecurityProfile
+        $DestVmConfig.UserData = $SourceVm.UserData
+        $DestVmConfig.Tags = $SourceVm.Tags
+        $DestVmConfig.Zones = $null # Recommend explicitly defining this to create a regional VM, as opposed to a zonal VM
         
-        Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Stopping source VM before checking disks potentially needing snapshots"
+        Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Stopping source VM before checking if disks are zonal, which will require snapshots"
         $SourceVm | Stop-AzVM -Force | Out-Null
 
         Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Checking source VM OS Disk for need of snapshot"
         # Check OS Disk zonality and update destination config
-        $sourceVmOsDiskRef = Get-AzResource -ResourceId $SourceVm.StorageProfile.OsDisk.ManagedDisk.Id
-        $sourceVmOsDisk = Get-AzDisk -ResourceGroupName $sourceVmOsDiskRef.ResourceGroupName -DiskName $sourceVmOsDiskRef.Name
+        $SourceVmOsDiskRef = Get-AzResource -ResourceId $SourceVm.StorageProfile.OsDisk.ManagedDisk.Id
+        $SourceVmOsDisk = Get-AzDisk -ResourceGroupName $SourceVmOsDiskRef.ResourceGroupName -DiskName $SourceVmOsDiskRef.Name
 
-        if ( $sourceVmOsDisk.Zones.Count -gt 0 ) # Does it matter if .Sku.Name matches Standard_LRS, Premium_LRS, StandardSSD_LRS? 
+        if ( $SourceVmOsDisk.Zones.Count -gt 0 ) # Does it matter if .Sku.Name matches Standard_LRS, Premium_LRS, StandardSSD_LRS? 
         {
-            $OsDiskSnapshotName = "$($sourceVmOsDisk.Name)-snapshot-$DiskNameSuffix"
-            $DestOsDiskName = "$($sourceVmOsDisk.Name)-$DiskNameSuffix"
-            Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Source VM OS Disk resides in Zone $($sourceVmOsDisk.Zones[0]) - creating snapshot `"$OsDiskSnapshotName`""
-            $sourceVmOsDiskSnapshotConfig = New-AzSnapshotConfig -SourceUri $sourceVmOsDisk.Id -Location $SourceVm.Location -CreateOption Copy -SkuName $sourceVmOsDisk.Sku.Name
-            $sourceVmOsDiskSnapshot = New-AzSnapshot -Snapshot $sourceVmOsDiskSnapshotConfig -SnapshotName $OsDiskSnapshotName -ResourceGroupName $sourceVmOsDisk.ResourceGroupName
+            $OsDiskSnapshotName = "$($SourceVmOsDisk.Name)-snapshot-$DiskNameSuffix" # must be 80 characters or less
+            if ($OsDiskSnapshotName.Length -gt 80 ) 
+            {
+                throw New-Object System.ArgumentException -ArgumentList ("Disk snapshot names must be 80 characters or less, got length $($OsDiskSnapshotName.Length); try a shorter disk name suffix. Source disk name is `"$($SourceVmOsDisk.Name)`", length $($SourceVmOsDisk.Name.Length); snapshot suffix is `"-snapshot-$DiskNameSuffix`", length $(Measure-Object "-snapshot-$DiskNameSuffix").","DiskNameSuffix") 
+            }
+            $DestOsDiskName = "$($SourceVmOsDisk.Name)-$DiskNameSuffix" # must be 80 characters or less
+            if ($DestOsDiskName.Length -gt 80 ) 
+            {
+                throw New-Object System.ArgumentException -ArgumentList ("Disk names must be 80 characters or less, got length $($DestOsDiskName.Length); try a shorter disk name suffix. Source disk name is `"$($SourceVmOsDisk.Name)`", length $($SourceVmOsDisk.Name.Length); snapshot suffix is `"-snapshot-$DiskNameSuffix`", length $(Measure-Object $DiskNameSuffix)","DiskNameSuffix") 
+            }
+
+            Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Source VM OS Disk resides in Zone $($SourceVmOsDisk.Zones[0]) - creating snapshot `"$OsDiskSnapshotName`""
+            $SourceVmOsDiskSnapshotConfig = New-AzSnapshotConfig -SourceUri $SourceVmOsDisk.Id -Location $SourceVm.Location -CreateOption Copy -SkuName $SourceVmOsDisk.Sku.Name
+            $SourceVmOsDiskSnapshot = New-AzSnapshot -Snapshot $SourceVmOsDiskSnapshotConfig -SnapshotName $OsDiskSnapshotName -ResourceGroupName $SourceVmOsDisk.ResourceGroupName
             
             Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Creating disk `"$DestOsDiskName`" from snapshot `"$OsDiskSnapshotName`""
-            $destVmOsDiskConfig = New-AzDiskConfig -SkuName $sourceVmOsDisk.Sku.Name -Location $sourceVmOsDisk.Location -CreateOption Copy -SourceResourceId $sourceVmOsDiskSnapshot.Id -DiskSizeGB $sourceVmOsDisk.DiskSizeGB
-            $destVmOsDisk = New-AzDisk -Disk $destVmOsDiskConfig -ResourceGroupName $sourceVmOsDisk.ResourceGroupName -DiskName $DestOsDiskName
+            $DestVmOsDiskConfig = New-AzDiskConfig -SkuName $SourceVmOsDisk.Sku.Name -Location $SourceVmOsDisk.Location -CreateOption Copy -SourceResourceId $SourceVmOsDiskSnapshot.Id -DiskSizeGB $SourceVmOsDisk.DiskSizeGB
+            $DestVmOsDisk = New-AzDisk -Disk $DestVmOsDiskConfig -ResourceGroupName $SourceVmOsDisk.ResourceGroupName -DiskName $DestOsDiskName
             
             # Add Source object's tags to destination objects, if not empty
-            if ( $sourceVmOsDisk.Tags.Count -gt 0 )
+            if ( $SourceVmOsDisk.Tags.Count -gt 0 )
             {
-                Write-Verbose "Tags $($sourceVmOsDisk.Tags)"
-                $sourceVmOsDiskSnapshot.Tags = $sourceVmOsDisk.Tags
-                $sourceVmOsDiskSnapshot | Update-AzSnapshot | Out-Null
-                $destVmOsDisk.Tags = $sourceVmOsDisk.Tags
-                $destVmOsDisk | Update-AzDisk | Out-Null
+                $SourceVmOsDiskSnapshot.Tags = $SourceVmOsDisk.Tags
+                $SourceVmOsDiskSnapshot | Update-AzSnapshot | Out-Null
+                $DestVmOsDisk.Tags = $SourceVmOsDisk.Tags
+                $DestVmOsDisk | Update-AzDisk | Out-Null
             }
 
             Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Attaching new OS disk `"$DestOsDiskName`" from snapshot of Source VM to destination VM"
             if ( $SourceVm.StorageProfile.OsDisk.OsType -eq "Windows" )
             {
-                Set-AzVMOSDisk -VM $destVmConfig -Name $destVmOsDisk.Name -CreateOption Attach -ManagedDiskId $destVmOsDisk.Id -Caching $SourceVm.StorageProfile.OsDisk.Caching -DeleteOption Detach -Windows
+                Set-AzVMOSDisk -VM $DestVmConfig -Name $DestVmOsDisk.Name -CreateOption Attach -ManagedDiskId $DestVmOsDisk.Id -Caching $SourceVm.StorageProfile.OsDisk.Caching -DeleteOption Detach -Windows | Out-Null
             }
             else 
             {
-                Set-AzVMOSDisk -VM $destVmConfig -Name $destVmOsDisk.Name -CreateOption Attach -ManagedDiskId $destVmOsDisk.Id -Caching $SourceVm.StorageProfile.OsDisk.Caching -DeleteOption Detach -Linux
+                Set-AzVMOSDisk -VM $DestVmConfig -Name $DestVmOsDisk.Name -CreateOption Attach -ManagedDiskId $DestVmOsDisk.Id -Caching $SourceVm.StorageProfile.OsDisk.Caching -DeleteOption Detach -Linux | Out-Null
             }
         }
         else # VM OS Disk is ZRS, or is regional already? Just attach the existing one
@@ -114,70 +111,85 @@ try {
             Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | OS Disk can be re-used, attaching source VM OS Disk to destination VM"
             if ( $SourceVm.StorageProfile.OsDisk.OsType -eq "Windows" )
             {
-                Set-AzVMOSDisk -VM $destVmConfig -Name $sourceVmOsDisk.Name -CreateOption Attach -ManagedDiskId $sourceVmOsDisk.Id -Caching $SourceVm.StorageProfile.OsDisk.Caching -DeleteOption Detach -Windows
+                Set-AzVMOSDisk -VM $DestVmConfig -Name $SourceVmOsDisk.Name -CreateOption Attach -ManagedDiskId $SourceVmOsDisk.Id -Caching $SourceVm.StorageProfile.OsDisk.Caching -DeleteOption Detach -Windows | Out-Null
             }
             else 
             {
-                Set-AzVMOSDisk -VM $destVmConfig -Name $sourceVmOsDisk.Name -CreateOption Attach -ManagedDiskId $sourceVmOsDisk.Id -Caching $SourceVm.StorageProfile.OsDisk.Caching -DeleteOption Detach -Linux
+                Set-AzVMOSDisk -VM $DestVmConfig -Name $SourceVmOsDisk.Name -CreateOption Attach -ManagedDiskId $SourceVmOsDisk.Id -Caching $SourceVm.StorageProfile.OsDisk.Caching -DeleteOption Detach -Linux | Out-Null
             }
         }
 
         Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Checking source VM Data Disk(s)"
         # Check Data Disk(s) zonality and update destination config
-        foreach ( $sourceDataDisk in $SourceVm.StorageProfile.DataDisks )
+        foreach ( $SourceVmDataDisk in $SourceVm.StorageProfile.DataDisks )
         {
-            if ( $sourceDataDisk.Zones.Count -gt 0 ) 
+
+            $SourceVmDataDiskRef = Get-AzResource -ResourceId $SourceVmDataDisk.ManagedDisk.Id
+            $SourceDataDisk = Get-AzDisk -ResourceGroupName $SourceVmDataDiskRef.ResourceGroupName -DiskName $SourceVmDataDiskRef.Name
+
+            if ( $SourceDataDisk.Zones.Count -gt 0 ) 
             {
-                $DataDiskSnapshotName = "$($sourceDataDisk.Name)-snapshot-$DiskNameSuffix"
-                $DestDataDiskName = "$($sourceDataDisk.Name)-$DiskNameSuffix"
-                Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Source VM Data Disk LUN $($sourceDataDisk.Lun) resides in Zone $($sourceDataDisk.Zones[0]) - creating snapshot `"$DataDiskSnapshotName`""
-                $sourceDataDiskSnapshotConfig = New-AzSnapshotConfig -SourceUri $sourceDataDisk.ManagedDisk.Id -Location $SourceVm.Location -CreateOption Copy -SkuName $sourceDataDisk.Sku.Name
-                $sourceDataDiskSnapshot = New-AzSnapshot -Snapshot $sourceDataDiskSnapshotConfig -SnapshotName $DataDiskSnapshotName -ResourceGroupName $sourceDataDisk.ResourceGroupName
-
-                Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Creating disk `"$DestDataDiskName`" from snapshot `"$DataDiskSnapshotName`""
-                $destDataDiskConfig = New-AzDiskConfig -SkuName $sourceDataDisk.Sku.Name -Location $sourceDataDisk.Location -CreateOption Copy -SourceResourceId $sourceDataDiskSnapshot.Id -DiskSizeGB $sourceDataDisk.DiskSizeGB
-                $destDataDisk = New-AzDisk -Disk $destDataDiskConfig -ResourceGroupName $sourceDataDisk.ResourceGroupName -DiskName $DestDataDiskName
-
-                # Add Source object's tags to destination objects, if not empty
-                if ( $sourceDataDisk.Tags.Count -gt 0 )
+                $DataDiskSnapshotName = "$($SourceDataDisk.Name)-snapshot-$DiskNameSuffix" # must be 80 characters or less
+                if ($DataDiskSnapshotName.Length -gt 80 ) 
                 {
-                    $sourceDataDiskSnapshot.Tags = $sourceDataDisk.Tags
-                    $sourceDataDiskSnapshot | Update-AzSnapshot | Out-Null
-                    $destDataDisk.Tags = $sourceDataDisk.Tags
-                    $destDataDisk | Update-AzDisk | Out-Null
+                    throw New-Object System.ArgumentException -ArgumentList ("Disk snapshot names must be 80 characters or less, got length $($DataDiskSnapshotName.Length); try a shorter disk name suffix. Source disk name is `"$($SourceDataDisk.Name)`", length $($SourceDataDisk.Name.Length); snapshot suffix is `"-snapshot-$DiskNameSuffix`", length $(Measure-Object "-snapshot-$DiskNameSuffix").","DiskNameSuffix") 
                 }
 
-                Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Attaching new data disk `"$DestDataDiskName`" from snapshot of source VM Data Disk LUN $($sourceDataDisk.Lun) to destination VM"
-                Add-AzVMDataDisk -VM $destVmConfig -Name $destDataDisk.Name -CreateOption Attach -ManagedDiskId $destDataDisk.Id -Caching $sourceDataDisk.Caching -Lun $sourceDataDisk.Lun -DiskSizeInGB $sourceDataDisk.DiskSizeGB -DeleteOption Detach
+                $DestDataDiskName = "$($SourceDataDisk.Name)-$DiskNameSuffix" # must be 80 characters or less
+                if ($DestDataDiskName.Length -gt 80 ) 
+                {
+                    throw New-Object System.ArgumentException -ArgumentList ("Disk names must be 80 characters or less, got length $($DestDataDiskName.Length); try a shorter disk name suffix. Source disk name is `"$($SourceDataDisk.Name)`", length $($SourceDataDisk.Name.Length); snapshot suffix is `"-snapshot-$DiskNameSuffix`", length $(Measure-Object $DiskNameSuffix)","DiskNameSuffix") 
+                }
+
+                Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Source VM Data Disk LUN $($SourceVmDataDisk.Lun) resides in Zone $($SourceDataDisk.Zones[0]) - creating snapshot `"$DataDiskSnapshotName`""
+                $SourceDataDiskSnapshotConfig = New-AzSnapshotConfig -SourceUri $SourceDataDisk.Id -Location $SourceVm.Location -CreateOption Copy -SkuName $SourceDataDisk.Sku.Name
+                $SourceDataDiskSnapshot = New-AzSnapshot -Snapshot $SourceDataDiskSnapshotConfig -SnapshotName $DataDiskSnapshotName -ResourceGroupName $SourceDataDisk.ResourceGroupName
+
+                Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Creating disk `"$DestDataDiskName`" from snapshot `"$DataDiskSnapshotName`""
+                $DestDataDiskConfig = New-AzDiskConfig -SkuName $SourceDataDisk.Sku.Name -Location $SourceDataDisk.Location -CreateOption Copy -SourceResourceId $SourceDataDiskSnapshot.Id -DiskSizeGB $SourceDataDisk.DiskSizeGB
+                $DestDataDisk = New-AzDisk -Disk $DestDataDiskConfig -ResourceGroupName $SourceDataDisk.ResourceGroupName -DiskName $DestDataDiskName
+
+                # Add Source object's tags to destination objects, if not empty
+                if ( $SourceDataDisk.Tags.Count -gt 0 )
+                {
+                    $SourceDataDiskSnapshot.Tags = $SourceDataDisk.Tags
+                    $SourceVmDataDiskSnapshot | Update-AzSnapshot | Out-Null
+                    $DestDataDisk.Tags = $SourceDataDisk.Tags
+                    $DestDataDisk | Update-AzDisk | Out-Null
+                }
+
+                Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Attaching new data disk `"$DestDataDiskName`" from snapshot of source VM Data Disk LUN $($SourceVmDataDisk.Lun) to destination VM"
+                Add-AzVMDataDisk -VM $DestVmConfig -Name $DestDataDisk.Name -CreateOption Attach -ManagedDiskId $DestDataDisk.Id -Caching $SourceVmDataDisk.Caching -Lun $SourceVmDataDisk.Lun -DiskSizeInGB $SourceVmDataDisk.DiskSizeGB -DeleteOption Detach | Out-Null
             }
             else # Data Disk is ZRS, or is regional already? Just attach the existing one
             {
-                Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Data Disk LUN $($sourceDataDisk.Lun) can be re-used, attaching source VM Data Disk to destination VM"
-                Add-AzVMDataDisk -VM $destVmConfig -Name $sourceDataDisk.Name -CreateOption Attach -ManagedDiskId $sourceDataDisk.ManagedDisk.Id -Caching $sourceDataDisk.Caching -Lun $sourceDataDisk.Lun -DiskSizeInGB $sourceDataDisk.DiskSizeGB -DeleteOption Detach
+                Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Data Disk LUN $($SourceVmDataDisk.Lun) can be re-used, attaching source VM Data Disk to destination VM"
+                Add-AzVMDataDisk -VM $DestVmConfig -Name $SourceVmDataDisk.Name -CreateOption Attach -ManagedDiskId $SourceVmDataDisk.ManagedDisk.Id -Caching $SourceVmDataDisk.Caching -Lun $SourceVmDataDisk.Lun -DiskSizeInGB $SourceVmDataDisk.DiskSizeGB -DeleteOption Detach | Out-Null
             }
         }
 
         Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Attaching source VM NICs to destination VM"
         # Add NIC to destination VM
-        foreach ( $nic in $SourceVm.NetworkProfile.NetworkInterfaces ) {	
-            if ( $nic.Primary -eq "True" )
+        foreach ( $VmNic in $SourceVm.NetworkProfile.NetworkInterfaces ) {	
+            if ( $VmNic.Primary -eq "True" )
             {
-                Add-AzVMNetworkInterface -VM $destVmConfig -Id $nic.Id -Primary -DeleteOption Detach
+                Add-AzVMNetworkInterface -VM $DestVmConfig -Id $VmNic.Id -Primary -DeleteOption Detach | Out-Null
             }
             else
             {
-                Add-AzVMNetworkInterface -VM $destVmConfig -Id $nic.Id -DeleteOption Detach
+                Add-AzVMNetworkInterface -VM $DestVmConfig -Id $VmNic.Id -DeleteOption Detach | Out-Null
             }
         }
 
         # Delete source VM
         Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | WARNING - Deleting source Zonal VM"
-        Remove-AzVM -Name $SourceVm.Name -ResourceGroupName $SourceVm.ResourceGroupName -Force
+        Remove-AzVM -Name $SourceVm.Name -ResourceGroupName $SourceVm.ResourceGroupName -Force | Out-Null
 
         # Create replacement VM
         Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Creating destination Regional VM"
-        New-AzVM -ResourceGroupName $SourceVm.ResourceGroupName -Location $SourceVm.Location -VM $destVmConfig -DisableBginfoExtension
+        New-AzVM -ResourceGroupName $SourceVm.ResourceGroupName -Location $SourceVm.Location -VM $DestVmConfig -DisableBginfoExtension | Out-Null
 
+        Write-Verbose -Message "VM $($SourceVm.Name) in ResourceGroup $($SourceVm.ResourceGroupName) | Finished"
     }
     else 
     {
